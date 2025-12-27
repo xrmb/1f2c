@@ -28,6 +28,7 @@ const state = {
     targetFolderHandle: null,
     targetFolderPath: null,
     receivedManifest: null,
+    targetIndex: new Map(), // relPath -> { size, modified, absPath? , handle? }
     
     // Transfer state
     isPaused: false,
@@ -35,6 +36,9 @@ const state = {
     currentFile: null,
     currentBlock: 0,
     bytesTransferred: 0,
+    bytesTotalPlanned: null, // receiver: total bytes that actually need to transfer (delta)
+    receiverReportedDone: false, // sender: receiver confirmed it needs nothing / is done
+    completionWarnings: [],
     startTime: null,
     fileMap: new Map(), // For storing file data during transfer
     
@@ -368,12 +372,16 @@ function cleanup() {
     state.targetFolderHandle = null;
     state.targetFolderPath = null;
     state.receivedManifest = null;
+    state.targetIndex.clear();
     state.shareCode = null;
     state.isPaused = false;
     state.transferring = false;
     state.currentFile = null;
     state.currentBlock = 0;
     state.bytesTransferred = 0;
+    state.bytesTotalPlanned = null;
+    state.receiverReportedDone = false;
+    state.completionWarnings = [];
     state.fileMap.clear();
 }
 
@@ -408,7 +416,15 @@ async function useCachedManifest(entry) {
         state.folderPath = folderPath;
         state.folderHandle = null;
     } else {
-        state.folderHandle = null; // Will need to re-select if files are accessed
+        // Cached manifest includes hashes already; this prompt is only to regain permission
+        // to read file bytes during transfer (no re-indexing / no re-hashing).
+        const handle = await window.showDirectoryPicker();
+        if (!handle) return;
+        if (handle.name !== entry.folderName) {
+            showError(`Selected folder "${handle.name}" does not match cached manifest "${entry.folderName}"`);
+            return;
+        }
+        state.folderHandle = handle;
         state.folderPath = null;
     }
     startSenderConnection();
@@ -782,9 +798,24 @@ function handleIncomingConnection(conn) {
     });
     
     conn.on('close', () => {
-        if (!state.transferring) {
-            showError('Connection closed by receiver');
+        // If we're mid-transfer, a close usually means the receiver finished and exited.
+        if (state.transferring && state.mode === 'sender' && state.manifest) {
+            if (state.receiverReportedDone) {
+                completeTransfer();
+                return;
+            }
+            const total = state.manifest.totalSize;
+            // Count as complete once we've streamed (at least) the full byte payload.
+            if (typeof total === 'number' && total >= 0 && state.bytesTransferred >= total) {
+                completeTransfer();
+                return;
+            }
+
+            showError('Connection closed by receiver before transfer completed');
+            return;
         }
+
+        showError('Connection closed by receiver');
     });
     
     conn.on('error', (error) => {
@@ -813,6 +844,13 @@ function handleSenderMessage(message) {
             break;
         case 'cancel':
             showError('Transfer cancelled by receiver');
+            break;
+        case 'receiver_done':
+            // Receiver indicates it did not need any data (or has completed without downloading).
+            state.receiverReportedDone = true;
+            if (state.transferring && state.mode === 'sender') {
+                completeTransfer();
+            }
             break;
         default:
             console.warn('Unknown message type:', message.type);
@@ -855,6 +893,10 @@ function handleApproval(accepted) {
         document.getElementById('peer-name').textContent = 'Connected';
         state.transferring = true;
         state.startTime = Date.now();
+        state.bytesTransferred = 0;
+        state.currentFile = null;
+        state.currentBlock = 0;
+        updateTransferUI();
     } else {
         state.connection.send({
             type: 'acknowledge',
@@ -900,6 +942,9 @@ async function sendBlock(filePath, blockIndex) {
             const absoluteFilePath = resolveAbsolutePath(state.folderPath, filePath);
             blockData = await window.electronAPI.readFileSlice(absoluteFilePath, start, end);
         } else {
+            if (!state.folderHandle) {
+                throw new Error('Folder access not granted. Re-select the cached folder before transferring.');
+            }
             // Get file handle (need to navigate directory structure)
             const fileHandle = await getFileHandle(state.folderHandle, filePath);
             const file = await fileHandle.getFile();
@@ -908,6 +953,12 @@ async function sendBlock(filePath, blockIndex) {
         
         // Split into chunks and send
         const chunkCount = Math.ceil(blockData.byteLength / CHUNK_SIZE);
+
+        // Update sender UI for current work item
+        state.currentFile = filePath;
+        state.currentBlock = blockIndex;
+        const currentFileEl = document.getElementById('current-file-name');
+        if (currentFileEl) currentFileEl.textContent = filePath;
         
         for (let i = 0; i < chunkCount; i++) {
             if (state.isPaused) {
@@ -934,6 +985,10 @@ async function sendBlock(filePath, blockIndex) {
                 total: chunkCount,
                 data: chunkData
             });
+
+            // Sender-side progress (bytes streamed)
+            state.bytesTransferred += chunkData.byteLength;
+            updateTransferUI();
             
             // Small delay to avoid overwhelming the connection
             await new Promise(resolve => setTimeout(resolve, 10));
@@ -1116,21 +1171,93 @@ async function selectTargetFolder() {
             state.targetFolderHandle = handle;
             state.targetFolderPath = null;
         }
-        
-        // Request manifest
-        state.connection.send({
-            type: 'request_manifest'
-        });
-        
+
+        // Index target folder first for delta sync
         showScreen('transfer-screen');
-        document.getElementById('transfer-title').textContent = 'Receiving Files';
+        document.getElementById('transfer-title').textContent = 'Scanning Target Folder';
+        document.getElementById('current-file-name').textContent = '';
+        state.bytesTransferred = 0;
+        state.bytesTotalPlanned = null;
+        updateTransferUI();
+
+        await indexReceiverTargetFolder();
+
+        // Request manifest
+        document.getElementById('transfer-title').textContent = 'Requesting Manifest';
+        state.connection.send({ type: 'request_manifest' });
+
+        // Transfer begins when manifest arrives
         state.transferring = true;
-        state.startTime = Date.now();
         
     } catch (error) {
         if (error.name !== 'AbortError') {
             showError('Failed to select folder: ' + error.message);
         }
+    }
+}
+
+async function indexReceiverTargetFolder() {
+    state.targetIndex.clear();
+
+    if (IS_ELECTRON) {
+        if (!state.targetFolderPath) throw new Error('Target folder not selected');
+        await scanReceiverTargetPath(state.targetFolderPath, '', state.targetIndex);
+    } else {
+        if (!state.targetFolderHandle) throw new Error('Target folder not selected');
+        await scanReceiverTargetHandle(state.targetFolderHandle, '', state.targetIndex);
+    }
+}
+
+async function scanReceiverTargetPath(rootPath, relativePath, indexMap) {
+    const absoluteDirPath = relativePath ? resolveAbsolutePath(rootPath, relativePath) : rootPath;
+
+    const entries = await window.electronAPI.listDir(absoluteDirPath);
+
+    for (const entry of entries) {
+        if (entry.kind !== 'file') continue;
+        const entryRelPath = relativePath ? normalizePath(relativePath + '\\' + entry.name) : entry.name;
+        const entryAbsPath = resolveAbsolutePath(rootPath, entryRelPath);
+        try {
+            const st = await window.electronAPI.statFile(entryAbsPath);
+            indexMap.set(entryRelPath, {
+                size: st.size,
+                modified: Math.round(st.mtimeMs),
+                absPath: entryAbsPath
+            });
+        } catch (_) {
+            // Skip unreadable files
+        }
+    }
+
+    for (const entry of entries) {
+        if (entry.kind !== 'directory') continue;
+        const entryRelPath = relativePath ? normalizePath(relativePath + '\\' + entry.name) : entry.name;
+        await scanReceiverTargetPath(rootPath, entryRelPath, indexMap);
+    }
+}
+
+async function scanReceiverTargetHandle(dirHandle, relativePath, indexMap) {
+    const entries = await listDirectoryEntries(dirHandle);
+
+    for (const { name, handle } of entries) {
+        if (handle.kind !== 'file') continue;
+        const entryPath = relativePath ? normalizePath(relativePath + '\\' + name) : name;
+        try {
+            const file = await handle.getFile();
+            indexMap.set(entryPath, {
+                size: file.size,
+                modified: file.lastModified,
+                handle
+            });
+        } catch (_) {
+            // Skip unreadable files
+        }
+    }
+
+    for (const { name, handle } of entries) {
+        if (handle.kind !== 'directory') continue;
+        const entryPath = relativePath ? normalizePath(relativePath + '\\' + name) : name;
+        await scanReceiverTargetHandle(handle, entryPath, indexMap);
     }
 }
 
@@ -1146,12 +1273,16 @@ async function startReceiving() {
     
     // Process files
     state.bytesTransferred = 0;
-    document.getElementById('transfer-total-bytes').textContent = formatBytes(manifest.totalSize);
+    state.bytesTotalPlanned = manifest.totalSize;
+    document.getElementById('transfer-total-bytes').textContent = formatBytes(state.bytesTotalPlanned);
     document.getElementById('file-progress').textContent = `0 / ${manifest.fileCount}`;
+
+    document.getElementById('transfer-title').textContent = 'Receiving Files';
+    state.startTime = Date.now();
     
     // Start requesting blocks
     state.currentFileIndex = 0;
-    requestNextBlock();
+    await requestNextBlock();
 }
 
 async function createDirectory(rootHandle, path) {
@@ -1169,7 +1300,7 @@ async function createDirectory(rootHandle, path) {
     }
 }
 
-function requestNextBlock() {
+async function requestNextBlock() {
     if (state.isPaused) return;
     
     const manifest = state.receivedManifest;
@@ -1182,33 +1313,140 @@ function requestNextBlock() {
             state.fileMap.set(file.path, {
                 blocks: new Map(),
                 completedBlocks: 0,
-                totalBlocks: file.blocks.length
+                totalBlocks: file.blocks.length,
+                nextBlockToProcess: 0,
+                preparedForFullDownload: false,
+                forceDownloadAll: false
             });
         }
         
         const fileData = state.fileMap.get(file.path);
+
+        // Determine if we can do delta checks (only when local file exists AND sizes match)
+        if (!fileData._initDelta) {
+            const local = state.targetIndex.get(file.path);
+            fileData.local = local || null;
+            fileData.forceDownloadAll = !local || local.size !== file.size;
+            fileData._initDelta = true;
+        }
+
+        // If local file size differs (or missing), ensure we start from a clean slate before requesting blocks
+        if (fileData.forceDownloadAll && !fileData.preparedForFullDownload) {
+            await prepareReceiverFileForFullDownload(file.path);
+            fileData.preparedForFullDownload = true;
+        }
         
-        if (fileData.completedBlocks < fileData.totalBlocks) {
-            // Request next block for this file
+        while (fileData.nextBlockToProcess < fileData.totalBlocks) {
+            const blockIndex = fileData.nextBlockToProcess;
+            fileData.nextBlockToProcess++;
+
+            const blockStart = blockIndex * BLOCK_SIZE;
+            const blockEnd = Math.min(blockStart + BLOCK_SIZE, file.size);
+            const blockLen = Math.max(0, blockEnd - blockStart);
+
+            let shouldDownload = true;
+            if (!fileData.forceDownloadAll) {
+                shouldDownload = await receiverShouldDownloadBlock(file, blockIndex, blockStart, blockEnd);
+            }
+
+            if (!shouldDownload) {
+                fileData.completedBlocks++;
+
+                // Adjust planned bytes downward as we discover blocks we can reuse locally.
+                if (typeof state.bytesTotalPlanned === 'number' && Number.isFinite(state.bytesTotalPlanned)) {
+                    state.bytesTotalPlanned = Math.max(state.bytesTransferred, state.bytesTotalPlanned - blockLen);
+                    const totalEl = document.getElementById('transfer-total-bytes');
+                    if (totalEl) totalEl.textContent = formatBytes(state.bytesTotalPlanned);
+                }
+
+                if (fileData.completedBlocks === fileData.totalBlocks) {
+                    break;
+                }
+                continue;
+            }
+
+            // Request this block
             state.currentFile = file.path;
-            state.currentBlock = fileData.completedBlocks;
-            
+            state.currentBlock = blockIndex;
+
             document.getElementById('current-file-name').textContent = file.path;
-            
+
             state.connection.send({
                 type: 'request_block',
                 file: file.path,
-                block: state.currentBlock
+                block: blockIndex
             });
-            
+
             return;
         }
         
+        // File complete (either fully reused or received)
         state.currentFileIndex++;
+
+        const completedFiles = state.currentFileIndex;
+        const totalFiles = state.receivedManifest.fileCount;
+        document.getElementById('file-progress').textContent = `${completedFiles} / ${totalFiles}`;
     }
     
     // All files complete!
+    // If receiver ends up needing nothing, explicitly notify sender so it can wrap up cleanly.
+    if (state.mode === 'receiver') {
+        const planned = typeof state.bytesTotalPlanned === 'number' && Number.isFinite(state.bytesTotalPlanned)
+            ? state.bytesTotalPlanned
+            : 0;
+        if (planned <= 0 && state.bytesTransferred === 0) {
+            try {
+                state.connection.send({ type: 'receiver_done' });
+            } catch (_) {}
+        }
+    }
     completeTransfer();
+}
+
+async function prepareReceiverFileForFullDownload(relPath) {
+    if (IS_ELECTRON) {
+        if (!state.targetFolderPath) throw new Error('Target folder not selected');
+        const abs = resolveAbsolutePath(state.targetFolderPath, relPath);
+        await window.electronAPI.truncateFile(abs, 0);
+        return;
+    }
+
+    if (!state.targetFolderHandle) throw new Error('Target folder not selected');
+    const parts = relPath.split('\\');
+    const fileName = parts.pop();
+    let dirHandle = state.targetFolderHandle;
+    for (const part of parts) {
+        dirHandle = await dirHandle.getDirectoryHandle(part, { create: true });
+    }
+    const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.truncate(0);
+    await writable.close();
+}
+
+async function receiverShouldDownloadBlock(fileInfo, blockIndex, start, end) {
+    const local = state.targetIndex.get(fileInfo.path);
+    if (!local) return true;
+    if (local.size !== fileInfo.size) return true;
+
+    let arrayBuffer;
+    if (IS_ELECTRON) {
+        const abs = local.absPath || (state.targetFolderPath ? resolveAbsolutePath(state.targetFolderPath, fileInfo.path) : null);
+        if (!abs) return true;
+        arrayBuffer = await window.electronAPI.readFileSlice(abs, start, end);
+    } else {
+        const fileHandle = local.handle || (state.targetFolderHandle ? await getReceiverFileHandle(state.targetFolderHandle, fileInfo.path) : null);
+        if (!fileHandle) return true;
+        const file = await fileHandle.getFile();
+        arrayBuffer = await file.slice(start, end).arrayBuffer();
+    }
+
+    const hashBuffer = await crypto.subtle.digest('SHA-256', arrayBuffer);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    const hashBase64 = btoa(String.fromCharCode.apply(null, hashArray));
+
+    const expectedHash = fileInfo.blocks[blockIndex].hash;
+    return hashBase64 !== expectedHash;
 }
 
 function receiveChunk(message) {
@@ -1287,7 +1525,7 @@ async function completeBlock(filePath, blockIndex) {
         document.getElementById('file-progress').textContent = `${completedFiles} / ${totalFiles}`;
         
         // Request next block
-        requestNextBlock();
+        await requestNextBlock();
         
     } catch (error) {
         showError('Failed to write file: ' + error.message);
@@ -1315,7 +1553,7 @@ async function writeBlockToFile(filePath, blockIndex, data, fileInfo) {
         
         // Get or create file
         const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
-        const writable = await fileHandle.createWritable();
+        const writable = await fileHandle.createWritable({ keepExistingData: true });
         
         // Seek to position and write
         await writable.seek(blockIndex * BLOCK_SIZE);
@@ -1337,11 +1575,18 @@ async function writeBlockToFile(filePath, blockIndex, data, fileInfo) {
 
 function addWarning(message) {
     const container = document.getElementById('transfer-warnings');
-    container.classList.remove('hidden');
-    const warning = document.createElement('div');
-    warning.className = 'warning-item';
-    warning.textContent = '⚠ ' + message;
-    container.appendChild(warning);
+    if (container) {
+        container.classList.remove('hidden');
+        const warning = document.createElement('div');
+        warning.className = 'warning-item';
+        warning.textContent = '⚠ ' + message;
+        container.appendChild(warning);
+    }
+
+    // Also persist warnings so they can be displayed on the complete screen.
+    if (Array.isArray(state.completionWarnings)) {
+        state.completionWarnings.push(message);
+    }
 }
 
 // ========== TRANSFER CONTROL ==========
@@ -1364,7 +1609,7 @@ function resumeTransfer() {
     document.getElementById('connection-indicator').className = 'status-badge';
     
     if (state.mode === 'receiver') {
-        requestNextBlock();
+        requestNextBlock().catch(e => showError(e && e.message ? e.message : String(e)));
     }
 }
 
@@ -1384,7 +1629,10 @@ function updateTransferUI() {
     document.getElementById('transfer-bytes').textContent = formatBytes(state.bytesTransferred);
     
     // Update percentage
-    const percent = (state.bytesTransferred / manifest.totalSize) * 100;
+    const totalSize = (state.mode === 'receiver' && typeof state.bytesTotalPlanned === 'number' && Number.isFinite(state.bytesTotalPlanned))
+        ? state.bytesTotalPlanned
+        : manifest.totalSize;
+    const percent = totalSize > 0 ? (state.bytesTransferred / totalSize) * 100 : 0;
     document.getElementById('transfer-progress').style.width = percent + '%';
     document.getElementById('transfer-percent').textContent = Math.round(percent) + '%';
     
@@ -1393,19 +1641,220 @@ function updateTransferUI() {
     const speed = state.bytesTransferred / elapsed;
     document.getElementById('transfer-speed').textContent = formatBytes(speed) + '/s';
     
-    const remaining = manifest.totalSize - state.bytesTransferred;
+    const remaining = totalSize - state.bytesTransferred;
     const eta = remaining / speed;
     document.getElementById('transfer-eta').textContent = formatTime(eta);
 }
 
-function completeTransfer() {
+function validateManifestForReceiver(manifest) {
+    if (!manifest || typeof manifest !== 'object') {
+        throw new Error('Validation failed: missing or invalid manifest');
+    }
+    if (!Array.isArray(manifest.files)) {
+        throw new Error('Validation failed: manifest.files is missing');
+    }
+    if (!Number.isFinite(manifest.totalSize) || manifest.totalSize < 0) {
+        throw new Error('Validation failed: manifest.totalSize is invalid');
+    }
+
+    const isSafeRelPath = (p) => {
+        if (typeof p !== 'string' || !p) return false;
+        // Prevent path traversal / absolute paths / drive letters
+        if (p.includes('..')) return false;
+        if (p.startsWith('\\') || p.startsWith('/') || p.startsWith('\\\\')) return false;
+        if (/^[A-Za-z]:/.test(p)) return false;
+        return true;
+    };
+
+    let computedTotal = 0;
+    for (const fileInfo of manifest.files) {
+        if (!fileInfo || typeof fileInfo !== 'object') {
+            throw new Error('Validation failed: manifest contains invalid file entry');
+        }
+        if (!isSafeRelPath(fileInfo.path)) {
+            throw new Error(`Validation failed: invalid file path "${fileInfo.path}"`);
+        }
+        if (!Number.isFinite(fileInfo.size) || fileInfo.size < 0) {
+            throw new Error(`Validation failed: invalid size for ${fileInfo.path}`);
+        }
+        if (!Array.isArray(fileInfo.blocks)) {
+            throw new Error(`Validation failed: missing blocks for ${fileInfo.path}`);
+        }
+
+        const expectedBlockCount = Math.ceil(fileInfo.size / BLOCK_SIZE);
+        if (fileInfo.blocks.length !== expectedBlockCount) {
+            throw new Error(
+                `Validation failed: block count mismatch for ${fileInfo.path} (expected ${expectedBlockCount}, got ${fileInfo.blocks.length})`
+            );
+        }
+
+        for (let i = 0; i < fileInfo.blocks.length; i++) {
+            const block = fileInfo.blocks[i];
+            if (!block || typeof block !== 'object') {
+                throw new Error(`Validation failed: invalid block entry for ${fileInfo.path} block ${i}`);
+            }
+            if (block.index !== i) {
+                throw new Error(`Validation failed: block index mismatch for ${fileInfo.path} (expected ${i}, got ${block.index})`);
+            }
+            if (typeof block.hash !== 'string' || !block.hash) {
+                throw new Error(`Validation failed: missing hash for ${fileInfo.path} block ${i}`);
+            }
+        }
+
+        computedTotal += fileInfo.size;
+    }
+
+    if (computedTotal !== manifest.totalSize) {
+        throw new Error(
+            `Validation failed: manifest totalSize mismatch (expected sum ${computedTotal}, got ${manifest.totalSize})`
+        );
+    }
+}
+
+async function validateReceivedFiles() {
+    const manifest = state.receivedManifest;
+    if (!manifest) throw new Error('No manifest available for validation');
+
+    validateManifestForReceiver(manifest);
+
+    const titleEl = document.getElementById('transfer-title');
+    if (titleEl) titleEl.textContent = 'Validating Files';
+
+    for (let fileIndex = 0; fileIndex < manifest.files.length; fileIndex++) {
+        const fileInfo = manifest.files[fileIndex];
+        const relPath = fileInfo.path;
+        const currentFileEl = document.getElementById('current-file-name');
+        if (currentFileEl) currentFileEl.textContent = relPath;
+
+        // Resolve file once per file
+        let actualSize;
+        let electronAbsPath = null;
+        let browserFile = null;
+
+        if (IS_ELECTRON) {
+            if (!state.targetFolderPath) throw new Error('Target folder not selected');
+            electronAbsPath = resolveAbsolutePath(state.targetFolderPath, relPath);
+            const st = await window.electronAPI.statFile(electronAbsPath);
+            actualSize = st.size;
+        } else {
+            if (!state.targetFolderHandle) throw new Error('Target folder not selected');
+            const fileHandle = await getReceiverFileHandle(state.targetFolderHandle, relPath);
+            browserFile = await fileHandle.getFile();
+            actualSize = browserFile.size;
+        }
+
+        if (actualSize !== fileInfo.size) {
+            throw new Error(`Validation failed: size mismatch for ${relPath} (expected ${fileInfo.size}, got ${actualSize})`);
+        }
+
+        // Hash check (per block)
+        for (let blockIndex = 0; blockIndex < fileInfo.blocks.length; blockIndex++) {
+            const start = blockIndex * BLOCK_SIZE;
+            const end = Math.min(start + BLOCK_SIZE, fileInfo.size);
+
+            let arrayBuffer;
+            if (IS_ELECTRON) {
+                arrayBuffer = await window.electronAPI.readFileSlice(electronAbsPath, start, end);
+            } else {
+                arrayBuffer = await browserFile.slice(start, end).arrayBuffer();
+            }
+
+            const hashBuffer = await crypto.subtle.digest('SHA-256', arrayBuffer);
+            const hashArray = Array.from(new Uint8Array(hashBuffer));
+            const hashBase64 = btoa(String.fromCharCode.apply(null, hashArray));
+
+            const expectedHash = fileInfo.blocks[blockIndex].hash;
+            if (hashBase64 !== expectedHash) {
+                throw new Error(`Validation failed: hash mismatch for ${relPath} block ${blockIndex}`);
+            }
+        }
+    }
+
+    // Warn (do not fail) if the target folder contains extra files not present in the manifest.
+    // This indicates the local folder's “manifest” differs from what was received.
+    try {
+        const localIndex = new Map();
+        if (IS_ELECTRON) {
+            if (!state.targetFolderPath) throw new Error('Target folder not selected');
+            await scanReceiverTargetPath(state.targetFolderPath, '', localIndex);
+        } else {
+            if (!state.targetFolderHandle) throw new Error('Target folder not selected');
+            await scanReceiverTargetHandle(state.targetFolderHandle, '', localIndex);
+        }
+
+        const expectedPaths = new Set(manifest.files.map(f => f.path));
+        const extras = [];
+        for (const relPath of localIndex.keys()) {
+            if (!expectedPaths.has(relPath)) {
+                extras.push(relPath);
+            }
+        }
+
+        if (extras.length > 0) {
+            addWarning(`Local target differs from sender manifest: ${extras.length} extra file(s) detected`);
+            extras.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+            const limit = 25;
+            for (let i = 0; i < Math.min(limit, extras.length); i++) {
+                addWarning(`Extra file: ${extras[i]}`);
+            }
+            if (extras.length > limit) {
+                addWarning(`...and ${extras.length - limit} more extra file(s)`);
+            }
+        }
+    } catch (e) {
+        // Validation succeeded; scanning extras is best-effort.
+        console.warn('Extra-file scan failed:', e);
+    }
+}
+
+async function getReceiverFileHandle(rootHandle, relPath) {
+    const parts = relPath.split('\\');
+    const fileName = parts.pop();
+    let dirHandle = rootHandle;
+    for (const part of parts) {
+        dirHandle = await dirHandle.getDirectoryHandle(part);
+    }
+    return await dirHandle.getFileHandle(fileName);
+}
+
+async function completeTransfer() {
     const manifest = state.mode === 'sender' ? state.manifest : state.receivedManifest;
     const elapsed = (Date.now() - state.startTime) / 1000;
+
+    if (state.mode === 'receiver') {
+        try {
+            await validateReceivedFiles();
+        } catch (e) {
+            try {
+                if (state.connection) state.connection.close();
+            } catch (_) {}
+            showError(e && e.message ? e.message : String(e));
+            return;
+        }
+    }
     
     document.getElementById('complete-stats').textContent = 
         `Transferred ${formatBytes(manifest.totalSize)} in ${formatTime(elapsed)}`;
     
     showScreen('complete-screen');
+
+    // Show any warnings gathered during transfer/validation on the complete screen.
+    const completeWarnings = document.getElementById('complete-warnings');
+    if (completeWarnings) {
+        completeWarnings.innerHTML = '';
+        const warnings = Array.isArray(state.completionWarnings) ? state.completionWarnings : [];
+        if (warnings.length > 0) {
+            completeWarnings.classList.remove('hidden');
+            for (const msg of warnings) {
+                const item = document.createElement('div');
+                item.className = 'warning-item';
+                item.textContent = '⚠ ' + msg;
+                completeWarnings.appendChild(item);
+            }
+        } else {
+            completeWarnings.classList.add('hidden');
+        }
+    }
     
     if (state.connection) {
         state.connection.close();
