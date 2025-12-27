@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>1f2c - 1 Folder 2 Computers</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#2563eb">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>1f2c</h1>
+            <p class="subtitle">1 Folder 2 Computers</p>
+        </header>
+
+        <!-- Username Setup Screen -->
+        <div id="username-screen" class="screen">
+            <div class="card">
+                <h2>Welcome!</h2>
+                <p>Enter your username to get started:</p>
+                <input type="text" id="username-input" placeholder="Your name" maxlength="30" />
+                <button id="username-submit" class="btn btn-primary">Continue</button>
+            </div>
+        </div>
+
+        <!-- Mode Selection Screen -->
+        <div id="mode-screen" class="screen hidden">
+            <div class="card">
+                <h2>Hello, <span id="display-username"></span>!</h2>
+                <p>Choose your role:</p>
+                <div class="mode-buttons">
+                    <button id="sender-mode-btn" class="btn btn-large btn-primary">
+                        <span class="icon">📤</span>
+                        Sender
+                        <span class="desc">Share a folder</span>
+                    </button>
+                    <button id="receiver-mode-btn" class="btn btn-large btn-secondary">
+                        <span class="icon">📥</span>
+                        Receiver
+                        <span class="desc">Receive files</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Sender: Folder Selection Screen -->
+        <div id="sender-folder-screen" class="screen hidden">
+            <div class="card">
+                <h2>Select Folder to Share</h2>
+                <p>Choose a folder with up to 10,000 files</p>
+                
+                <div id="cached-manifests" class="hidden">
+                    <h3>Recent Folders</h3>
+                    <div id="cached-list"></div>
+                    <p class="divider">or</p>
+                </div>
+                
+                <button id="select-folder-btn" class="btn btn-primary">
+                    <span class="icon">📁</span>
+                    Select Folder
+                </button>
+                <button id="sender-back-btn" class="btn btn-text">Back</button>
+            </div>
+        </div>
+
+        <!-- Sender: Indexing Screen -->
+        <div id="sender-indexing-screen" class="screen hidden">
+            <div class="card">
+                <h2>Indexing Files</h2>
+                <p id="indexing-status">Scanning folder...</p>
+                <div class="progress-container">
+                    <div class="progress-bar">
+                        <div id="indexing-progress" class="progress-fill"></div>
+                    </div>
+                    <div class="progress-text">
+                        <span id="indexing-current">0</span> / <span id="indexing-total">0</span> files
+                        <span id="indexing-percent">0%</span>
+                    </div>
+                </div>
+                <p id="indexing-current-file" class="current-file"></p>
+                <button id="cancel-indexing-btn" class="btn btn-danger">Cancel</button>
+            </div>
+        </div>
+
+        <!-- Sender: Share Code Display -->
+        <div id="sender-share-screen" class="screen hidden">
+            <div class="card">
+                <h2>Share Code</h2>
+                <p>Share this code with the receiver:</p>
+                <div class="share-code-display">
+                    <div id="share-code" class="share-code"></div>
+                    <button id="copy-code-btn" class="btn btn-small">Copy</button>
+                </div>
+                <div id="connection-waiting">
+                    <p class="status-text">Waiting for connection...</p>
+                    <div class="spinner"></div>
+                </div>
+                <button id="sender-cancel-btn" class="btn btn-danger">Cancel</button>
+            </div>
+        </div>
+
+        <!-- Sender: Connection Request -->
+        <div id="sender-approve-screen" class="screen hidden">
+            <div class="card">
+                <h2>Connection Request</h2>
+                <p><strong><span id="receiver-username"></span></strong> wants to connect</p>
+                <div class="approve-buttons">
+                    <button id="approve-btn" class="btn btn-primary">Approve</button>
+                    <button id="reject-btn" class="btn btn-danger">Reject</button>
+                </div>
+                <p id="approve-timeout" class="timeout-text"></p>
+            </div>
+        </div>
+
+        <!-- Receiver: Share Code Entry -->
+        <div id="receiver-code-screen" class="screen hidden">
+            <div class="card">
+                <h2>Enter Share Code</h2>
+                <p>Enter the 8-character code from the sender:</p>
+                <input type="text" id="share-code-input" placeholder="A3F9K2M7" maxlength="8" 
+                       style="text-transform: uppercase; text-align: center; font-size: 1.5em;" />
+                <p id="code-error" class="error-text hidden"></p>
+                <button id="connect-btn" class="btn btn-primary">Connect</button>
+                <button id="receiver-back-btn" class="btn btn-text">Back</button>
+            </div>
+        </div>
+
+        <!-- Receiver: Waiting for Approval -->
+        <div id="receiver-waiting-screen" class="screen hidden">
+            <div class="card">
+                <h2>Waiting for Approval</h2>
+                <p>Waiting for sender to approve connection...</p>
+                <div class="spinner"></div>
+                <p id="waiting-timeout" class="timeout-text"></p>
+                <button id="receiver-cancel-waiting-btn" class="btn btn-danger">Cancel</button>
+            </div>
+        </div>
+
+        <!-- Receiver: Target Folder Selection -->
+        <div id="receiver-folder-screen" class="screen hidden">
+            <div class="card">
+                <h2>Select Destination Folder</h2>
+                <p>Choose where to save the files</p>
+                <button id="select-target-folder-btn" class="btn btn-primary">
+                    <span class="icon">📁</span>
+                    Select Folder
+                </button>
+            </div>
+        </div>
+
+        <!-- Transfer Screen (Both Sender and Receiver) -->
+        <div id="transfer-screen" class="screen hidden">
+            <div class="card">
+                <h2 id="transfer-title">Transferring Files</h2>
+                
+                <div class="connection-status">
+                    <span id="connection-indicator" class="status-badge">Connected</span>
+                    <span id="peer-name"></span>
+                </div>
+
+                <div class="progress-container">
+                    <div class="progress-bar">
+                        <div id="transfer-progress" class="progress-fill"></div>
+                    </div>
+                    <div class="progress-text">
+                        <span id="transfer-bytes">0 MB</span> / <span id="transfer-total-bytes">0 MB</span>
+                        <span id="transfer-percent">0%</span>
+                    </div>
+                </div>
+
+                <div class="transfer-stats">
+                    <div class="stat">
+                        <span class="stat-label">Current File:</span>
+                        <span id="current-file-name" class="stat-value">-</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-label">Files:</span>
+                        <span id="file-progress" class="stat-value">0 / 0</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-label">Speed:</span>
+                        <span id="transfer-speed" class="stat-value">0 MB/s</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-label">ETA:</span>
+                        <span id="transfer-eta" class="stat-value">Calculating...</span>
+                    </div>
+                </div>
+
+                <div id="transfer-warnings" class="warnings hidden"></div>
+
+                <div class="transfer-controls">
+                    <button id="pause-btn" class="btn btn-secondary">Pause</button>
+                    <button id="resume-btn" class="btn btn-primary hidden">Resume</button>
+                    <button id="cancel-transfer-btn" class="btn btn-danger">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Complete Screen -->
+        <div id="complete-screen" class="screen hidden">
+            <div class="card">
+                <div class="success-icon">✓</div>
+                <h2>Transfer Complete!</h2>
+                <p id="complete-stats"></p>
+                <button id="new-transfer-btn" class="btn btn-primary">New Transfer</button>
+            </div>
+        </div>
+
+        <!-- Error Screen -->
+        <div id="error-screen" class="screen hidden">
+            <div class="card">
+                <div class="error-icon">⚠</div>
+                <h2>Error</h2>
+                <p id="error-message" class="error-text"></p>
+                <button id="error-ok-btn" class="btn btn-primary">OK</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/peerjs@latest/dist/peerjs.min.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
