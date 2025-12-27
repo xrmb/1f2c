@@ -8,6 +8,8 @@ const MAX_FILES = 10000;
 const CONNECTION_TIMEOUT = 60000; // 60 seconds
 const CACHE_EXPIRY_DAYS = 7;
 
+const IS_ELECTRON = !!(window.electronAPI && window.electronAPI.isElectron);
+
 // ========== STATE ==========
 const state = {
     username: null,
@@ -18,11 +20,13 @@ const state = {
     
     // Sender state
     folderHandle: null,
+    folderPath: null,
     manifest: null,
     manifestCache: [],
     
     // Receiver state
     targetFolderHandle: null,
+    targetFolderPath: null,
     receivedManifest: null,
     
     // Transfer state
@@ -81,6 +85,45 @@ function normalizePath(path) {
     return path.replace(/\//g, '\\');
 }
 
+async function ensurePeerJsLoaded() {
+    if (window.Peer) return;
+
+    const loadScript = (src) => new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = src;
+        s.async = true;
+        s.onload = () => resolve();
+        s.onerror = () => reject(new Error('Failed to load script: ' + src));
+        document.head.appendChild(s);
+    });
+
+    // Prefer local PeerJS when running in Electron (offline-friendly).
+    if (IS_ELECTRON) {
+        try {
+            await loadScript('./node_modules/peerjs/dist/peerjs.min.js');
+            if (window.Peer) return;
+        } catch (e) {
+            // Fall through to CDN.
+            console.warn(e);
+        }
+    }
+
+    await loadScript('https://cdn.jsdelivr.net/npm/peerjs@latest/dist/peerjs.min.js');
+}
+
+function getRootFolderNameFromSelection(dirHandleOrPath) {
+    if (typeof dirHandleOrPath === 'string') {
+        return window.electronAPI.basename(dirHandleOrPath);
+    }
+    return dirHandleOrPath.name;
+}
+
+function resolveAbsolutePath(rootPath, relativePath) {
+    if (!rootPath) throw new Error('Root path not set');
+    const parts = normalizePath(relativePath).split('\\').filter(Boolean);
+    return window.electronAPI.joinPath(rootPath, ...parts);
+}
+
 // ========== LOCAL STORAGE ==========
 
 function saveUsername(username) {
@@ -122,9 +165,52 @@ function loadManifestCache() {
 // ========== INITIALIZATION ==========
 
 document.addEventListener('DOMContentLoaded', () => {
+    initializeTheme();
     initializeApp();
     setupEventListeners();
 });
+
+function initializeTheme() {
+    const toggle = document.getElementById('theme-toggle');
+    if (toggle) {
+        toggle.addEventListener('click', () => {
+            const current = document.documentElement.classList.contains('dark') ? 'dark' : 'light';
+            const next = current === 'dark' ? 'light' : 'dark';
+            localStorage.setItem('1f2c_theme', next);
+            applyTheme(next);
+        });
+    }
+
+    const stored = localStorage.getItem('1f2c_theme'); // 'light' | 'dark' | null
+    const media = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+    const prefersDark = media ? media.matches : false;
+    const theme = stored || (prefersDark ? 'dark' : 'light');
+    applyTheme(theme);
+
+    // If user hasn't explicitly chosen a theme, track system/browser theme changes.
+    if (!stored && media) {
+        const onChange = (e) => {
+            const stillNoUserChoice = !localStorage.getItem('1f2c_theme');
+            if (!stillNoUserChoice) return;
+            applyTheme(e.matches ? 'dark' : 'light');
+        };
+
+        if (typeof media.addEventListener === 'function') {
+            media.addEventListener('change', onChange);
+        } else if (typeof media.addListener === 'function') {
+            media.addListener(onChange);
+        }
+    }
+}
+
+function applyTheme(theme) {
+    document.documentElement.classList.toggle('dark', theme === 'dark');
+
+    const toggle = document.getElementById('theme-toggle');
+    if (toggle) {
+        toggle.textContent = theme === 'dark' ? 'Light mode' : 'Dark mode';
+    }
+}
 
 function initializeApp() {
     const username = loadUsername();
@@ -203,9 +289,10 @@ function startSenderMode() {
     
     // Load cached manifests
     const cache = loadManifestCache();
+    const cacheContainer = document.getElementById('cached-manifests');
+    const cacheList = document.getElementById('cached-list');
+    
     if (cache.length > 0) {
-        const cacheContainer = document.getElementById('cached-manifests');
-        const cacheList = document.getElementById('cached-list');
         cacheList.innerHTML = '';
         
         cache.forEach((entry, index) => {
@@ -214,15 +301,39 @@ function startSenderMode() {
             btn.innerHTML = `
                 <strong>${entry.folderName}</strong><br>
                 <small>${entry.manifest.fileCount} files, ${formatBytes(entry.manifest.totalSize)}</small>
+                <span class="cache-dismiss" data-folder="${entry.folderName}">×</span>
             `;
-            btn.addEventListener('click', () => useCachedManifest(entry));
+            btn.addEventListener('click', (e) => {
+                if (!e.target.classList.contains('cache-dismiss')) {
+                    useCachedManifest(entry);
+                }
+            });
             cacheList.appendChild(btn);
         });
         
+        // Add event listeners to dismiss buttons
+        cacheList.querySelectorAll('.cache-dismiss').forEach(dismissBtn => {
+            dismissBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const folderName = e.target.dataset.folder;
+                removeCachedManifest(folderName);
+                startSenderMode(); // Refresh the list
+            });
+        });
+        
         cacheContainer.classList.remove('hidden');
+    } else {
+        // Hide container if no cached manifests
+        cacheContainer.classList.add('hidden');
     }
     
     showScreen('sender-folder-screen');
+}
+
+function removeCachedManifest(folderName) {
+    const cache = loadManifestCache();
+    const filtered = cache.filter(c => c.folderName !== folderName);
+    localStorage.setItem('1f2c_manifest_cache', JSON.stringify(filtered));
 }
 
 function startReceiverMode() {
@@ -252,8 +363,10 @@ function cleanup() {
     }
     
     state.folderHandle = null;
+    state.folderPath = null;
     state.manifest = null;
     state.targetFolderHandle = null;
+    state.targetFolderPath = null;
     state.receivedManifest = null;
     state.shareCode = null;
     state.isPaused = false;
@@ -268,9 +381,18 @@ function cleanup() {
 
 async function selectFolder() {
     try {
-        const handle = await window.showDirectoryPicker();
-        state.folderHandle = handle;
-        await indexFolder(handle);
+        if (IS_ELECTRON) {
+            const folderPath = await window.electronAPI.pickDirectory();
+            if (!folderPath) return;
+            state.folderPath = folderPath;
+            state.folderHandle = null;
+            await indexFolder(folderPath);
+        } else {
+            const handle = await window.showDirectoryPicker();
+            state.folderHandle = handle;
+            state.folderPath = null;
+            await indexFolder(handle);
+        }
     } catch (error) {
         if (error.name !== 'AbortError') {
             showError('Failed to select folder: ' + error.message);
@@ -280,14 +402,41 @@ async function selectFolder() {
 
 async function useCachedManifest(entry) {
     state.manifest = entry.manifest;
-    state.folderHandle = null; // Will need to re-select if files are accessed
+    if (IS_ELECTRON) {
+        const folderPath = await window.electronAPI.pickDirectory();
+        if (!folderPath) return;
+        state.folderPath = folderPath;
+        state.folderHandle = null;
+    } else {
+        state.folderHandle = null; // Will need to re-select if files are accessed
+        state.folderPath = null;
+    }
     startSenderConnection();
 }
 
 let indexingCancelled = false;
+let scannerLogs = [];
 
-async function indexFolder(dirHandle) {
+function addScannerLog(message, type = 'info') {
+    const timestamp = new Date().toLocaleTimeString();
+    const logEntry = `[${timestamp}] ${message}`;
+    scannerLogs.push(logEntry);
+    console.log(logEntry);
+    
+    // Update log display if it exists
+    const logContainer = document.getElementById('scanner-logs');
+    if (logContainer) {
+        const logItem = document.createElement('div');
+        logItem.className = `log-item log-${type}`;
+        logItem.textContent = logEntry;
+        logContainer.appendChild(logItem);
+        logContainer.scrollTop = logContainer.scrollHeight;
+    }
+}
+
+async function indexFolder(dirHandleOrPath) {
     indexingCancelled = false;
+    scannerLogs = [];
     showScreen('sender-indexing-screen');
     
     const files = [];
@@ -298,14 +447,23 @@ async function indexFolder(dirHandle) {
     document.getElementById('indexing-total').textContent = '?';
     document.getElementById('indexing-percent').textContent = '0%';
     
+    addScannerLog(`Starting scan of folder: ${getRootFolderNameFromSelection(dirHandleOrPath)}`, 'info');
+    
     try {
         // Recursively scan folder
-        await scanDirectory(dirHandle, '', files, folders);
+        if (IS_ELECTRON) {
+            await scanDirectoryPath(dirHandleOrPath, '', files, folders);
+        } else {
+            await scanDirectory(dirHandleOrPath, '', files, folders);
+        }
         
         if (indexingCancelled) {
+            addScannerLog('Scan cancelled by user', 'warning');
             showScreen('sender-folder-screen');
             return;
         }
+        
+        addScannerLog(`Scan complete: ${folders.length} folders, ${files.length} files found`, 'success');
         
         if (files.length > MAX_FILES) {
             showError(`Folder contains ${files.length} files. Maximum is ${MAX_FILES} files.`);
@@ -314,6 +472,8 @@ async function indexFolder(dirHandle) {
         
         document.getElementById('indexing-total').textContent = files.length;
         document.getElementById('indexing-status').textContent = 'Hashing files...';
+        
+        addScannerLog('Starting hash computation...', 'info');
         
         // Hash files
         const manifest = {
@@ -326,6 +486,7 @@ async function indexFolder(dirHandle) {
         
         for (let i = 0; i < files.length; i++) {
             if (indexingCancelled) {
+                addScannerLog('Hashing cancelled by user', 'warning');
                 showScreen('sender-folder-screen');
                 return;
             }
@@ -338,54 +499,214 @@ async function indexFolder(dirHandle) {
             document.getElementById('indexing-progress').style.width = progress + '%';
             document.getElementById('indexing-percent').textContent = Math.round(progress) + '%';
             
-            const blocks = await hashFile(fileInfo.file);
+            addScannerLog(`Hashing file [${i + 1}/${files.length}]: ${fileInfo.path}`, 'info');
+
+            let blocks;
+            let size;
+            let modified;
+
+            if (IS_ELECTRON) {
+                blocks = await hashFilePath(fileInfo.absPath, fileInfo.path, fileInfo.size);
+                size = fileInfo.size;
+                modified = fileInfo.modified;
+            } else {
+                blocks = await hashFile(fileInfo.file, fileInfo.path);
+                size = fileInfo.file.size;
+                modified = fileInfo.file.lastModified;
+            }
             
             manifest.files.push({
                 path: fileInfo.path,
-                size: fileInfo.file.size,
-                modified: fileInfo.file.lastModified,
+                size,
+                modified,
                 blocks: blocks
             });
             
-            manifest.totalSize += fileInfo.file.size;
+            manifest.totalSize += size;
         }
+        
+        addScannerLog(`Hash computation complete. Total size: ${formatBytes(manifest.totalSize)}`, 'success');
         
         state.manifest = manifest;
         
         // Cache manifest
-        saveManifestCache(dirHandle.name, manifest);
+        saveManifestCache(getRootFolderNameFromSelection(dirHandleOrPath), manifest);
         
         // Start sender connection
         startSenderConnection();
         
     } catch (error) {
+        addScannerLog(`Error: ${error.message}`, 'error');
         showError('Indexing failed: ' + error.message);
     }
 }
 
-async function scanDirectory(dirHandle, relativePath, files, folders) {
-    if (indexingCancelled) return;
-    
-    for await (const entry of dirHandle.values()) {
+async function scanDirectoryPath(rootPath, relativePath, files, folders) {
+    if (indexingCancelled) {
+        addScannerLog('Scan cancelled by user', 'warning');
+        return;
+    }
+
+    const folderLabel = relativePath || window.electronAPI.basename(rootPath);
+    addScannerLog(`Scanning folder: ${folderLabel}`, 'info');
+
+    const absoluteDirPath = relativePath ? resolveAbsolutePath(rootPath, relativePath) : rootPath;
+
+    let entries;
+    try {
+        entries = await window.electronAPI.listDir(absoluteDirPath);
+    } catch (error) {
+        addScannerLog(`  Unable to enumerate folder: ${folderLabel} (${error.message})`, 'warning');
+        return;
+    }
+
+    addScannerLog(`  Enumerated ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}`, 'info');
+
+    // Files first
+    for (const entry of entries) {
         if (indexingCancelled) return;
-        
-        const entryPath = relativePath ? normalizePath(relativePath + '\\' + entry.name) : entry.name;
-        
-        if (entry.kind === 'file') {
-            const file = await entry.getFile();
+        if (entry.kind !== 'file') continue;
+
+        const entryRelPath = relativePath ? normalizePath(relativePath + '\\' + entry.name) : entry.name;
+        const entryAbsPath = resolveAbsolutePath(rootPath, entryRelPath);
+
+        try {
+            const st = await window.electronAPI.statFile(entryAbsPath);
             files.push({
-                handle: entry,
-                file: file,
-                path: entryPath
+                absPath: entryAbsPath,
+                path: entryRelPath,
+                size: st.size,
+                modified: Math.round(st.mtimeMs)
             });
-        } else if (entry.kind === 'directory') {
-            folders.push(entryPath);
-            await scanDirectory(entry, entryPath, files, folders);
+            addScannerLog(`  Found file: ${entry.name} (${formatBytes(st.size)})`, 'info');
+        } catch (error) {
+            addScannerLog(`  Skipping unreadable file: ${entryRelPath} (${error.message})`, 'warning');
+        }
+    }
+
+    // Then subfolders
+    for (const entry of entries) {
+        if (indexingCancelled) return;
+        if (entry.kind !== 'directory') continue;
+
+        const entryRelPath = relativePath ? normalizePath(relativePath + '\\' + entry.name) : entry.name;
+        folders.push(entryRelPath);
+        addScannerLog(`  Found subfolder: ${entry.name}`, 'info');
+
+        try {
+            await scanDirectoryPath(rootPath, entryRelPath, files, folders);
+        } catch (error) {
+            addScannerLog(`  Skipping unreadable folder: ${entryRelPath} (${error.message})`, 'warning');
         }
     }
 }
 
-async function hashFile(file) {
+async function hashFilePath(absoluteFilePath, relativeFilePath, fileSize) {
+    const blocks = [];
+    const blockCount = Math.ceil(fileSize / BLOCK_SIZE);
+
+    for (let i = 0; i < blockCount; i++) {
+        if (indexingCancelled) throw new Error('Cancelled');
+
+        const start = i * BLOCK_SIZE;
+        const end = Math.min(start + BLOCK_SIZE, fileSize);
+        const arrayBuffer = await window.electronAPI.readFileSlice(absoluteFilePath, start, end);
+        const hashBuffer = await crypto.subtle.digest('SHA-256', arrayBuffer);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        const hashBase64 = btoa(String.fromCharCode.apply(null, hashArray));
+
+        blocks.push({
+            index: i,
+            hash: hashBase64
+        });
+
+        addScannerLog(`    Block ${i}/${blockCount - 1}: ${hashBase64.substring(0, 16)}...`, 'info');
+    }
+
+    addScannerLog(`  Completed hashing: ${relativeFilePath} (${blockCount} blocks)`, 'success');
+    return blocks;
+}
+
+async function listDirectoryEntries(dirHandle) {
+    // Prefer entries() so we always get the name+handle pairs.
+    // Fallback to values() if needed.
+    const entries = [];
+
+    if (typeof dirHandle.entries === 'function') {
+        for await (const [name, handle] of dirHandle.entries()) {
+            entries.push({ name, handle });
+        }
+    } else {
+        for await (const handle of dirHandle.values()) {
+            entries.push({ name: handle.name, handle });
+        }
+    }
+
+    // Deterministic order makes debugging easier.
+    entries.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+    return entries;
+}
+
+async function scanDirectory(dirHandle, relativePath, files, folders) {
+    if (indexingCancelled) {
+        addScannerLog('Scan cancelled by user', 'warning');
+        return;
+    }
+
+    const folderPath = relativePath || dirHandle.name;
+    addScannerLog(`Scanning folder: ${folderPath}`, 'info');
+
+    let entries;
+    try {
+        entries = await listDirectoryEntries(dirHandle);
+    } catch (error) {
+        addScannerLog(`  Unable to enumerate folder: ${folderPath} (${error.message})`, 'warning');
+        return;
+    }
+
+    addScannerLog(`  Enumerated ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}`, 'info');
+
+    // Process files first (prevents “looks like it skipped files” when a big subfolder appears early)
+    for (const { name, handle } of entries) {
+        if (indexingCancelled) return;
+
+        const entryPath = relativePath
+            ? normalizePath(relativePath + '\\' + name)
+            : name;
+
+        if (handle.kind !== 'file') continue;
+
+        try {
+            const file = await handle.getFile();
+            files.push({ file, path: entryPath });
+            addScannerLog(`  Found file: ${name} (${formatBytes(file.size)})`, 'info');
+        } catch (error) {
+            addScannerLog(`  Skipping unreadable file: ${entryPath} (${error.message})`, 'warning');
+        }
+    }
+
+    // Then process subfolders
+    for (const { name, handle } of entries) {
+        if (indexingCancelled) return;
+
+        const entryPath = relativePath
+            ? normalizePath(relativePath + '\\' + name)
+            : name;
+
+        if (handle.kind !== 'directory') continue;
+
+        folders.push(entryPath);
+        addScannerLog(`  Found subfolder: ${name}`, 'info');
+
+        try {
+            await scanDirectory(handle, entryPath, files, folders);
+        } catch (error) {
+            addScannerLog(`  Skipping unreadable folder: ${entryPath} (${error.message})`, 'warning');
+        }
+    }
+}
+
+async function hashFile(file, filePath) {
     const blocks = [];
     const blockCount = Math.ceil(file.size / BLOCK_SIZE);
     
@@ -404,7 +725,11 @@ async function hashFile(file) {
             index: i,
             hash: hashBase64
         });
+        
+        addScannerLog(`    Block ${i}/${blockCount - 1}: ${hashBase64.substring(0, 16)}...`, 'info');
     }
+    
+    addScannerLog(`  Completed hashing: ${filePath} (${blockCount} blocks)`, 'success');
     
     return blocks;
 }
@@ -423,19 +748,23 @@ function startSenderConnection() {
     showScreen('sender-share-screen');
     
     // Initialize PeerJS
-    state.peer = new Peer(code);
-    
-    state.peer.on('open', () => {
-        console.log('Sender peer initialized:', code);
-    });
-    
-    state.peer.on('connection', (conn) => {
-        handleIncomingConnection(conn);
-    });
-    
-    state.peer.on('error', (error) => {
-        console.error('Peer error:', error);
-        showError('Connection error: ' + error.message);
+    ensurePeerJsLoaded().then(() => {
+        state.peer = new Peer(code);
+
+        state.peer.on('open', () => {
+            console.log('Sender peer initialized:', code);
+        });
+        
+        state.peer.on('connection', (conn) => {
+            handleIncomingConnection(conn);
+        });
+        
+        state.peer.on('error', (error) => {
+            console.error('Peer error:', error);
+            showError('Connection error: ' + error.message);
+        });
+    }).catch((error) => {
+        showError('Failed to load PeerJS: ' + error.message);
     });
 }
 
@@ -558,14 +887,24 @@ async function sendBlock(filePath, blockIndex) {
             throw new Error('File not found: ' + filePath);
         }
         
-        // Get file handle (need to navigate directory structure)
-        const fileHandle = await getFileHandle(state.folderHandle, filePath);
-        const file = await fileHandle.getFile();
-        
         // Read block
         const start = blockIndex * BLOCK_SIZE;
-        const end = Math.min(start + BLOCK_SIZE, file.size);
-        const blockData = await file.slice(start, end).arrayBuffer();
+        const end = Math.min(start + BLOCK_SIZE, fileInfo.size);
+
+        let blockData;
+
+        if (IS_ELECTRON) {
+            if (!state.folderPath) {
+                throw new Error('Folder not selected. Please re-select the folder to share.');
+            }
+            const absoluteFilePath = resolveAbsolutePath(state.folderPath, filePath);
+            blockData = await window.electronAPI.readFileSlice(absoluteFilePath, start, end);
+        } else {
+            // Get file handle (need to navigate directory structure)
+            const fileHandle = await getFileHandle(state.folderHandle, filePath);
+            const file = await fileHandle.getFile();
+            blockData = await file.slice(start, end).arrayBuffer();
+        }
         
         // Split into chunks and send
         const chunkCount = Math.ceil(blockData.byteLength / CHUNK_SIZE);
@@ -653,16 +992,21 @@ function connectToSender() {
     state.shareCode = code;
     
     // Initialize PeerJS and connect
-    state.peer = new Peer();
-    
-    state.peer.on('open', () => {
-        console.log('Receiver peer initialized');
-        connectToPeer(code);
-    });
-    
-    state.peer.on('error', (error) => {
-        console.error('Peer error:', error);
-        document.getElementById('code-error').textContent = 'Failed to connect: ' + error.message;
+    ensurePeerJsLoaded().then(() => {
+        state.peer = new Peer();
+
+        state.peer.on('open', () => {
+            console.log('Receiver peer initialized');
+            connectToPeer(code);
+        });
+        
+        state.peer.on('error', (error) => {
+            console.error('Peer error:', error);
+            document.getElementById('code-error').textContent = 'Failed to connect: ' + error.message;
+            document.getElementById('code-error').classList.remove('hidden');
+        });
+    }).catch((error) => {
+        document.getElementById('code-error').textContent = 'Failed to load PeerJS: ' + error.message;
         document.getElementById('code-error').classList.remove('hidden');
     });
 }
@@ -762,8 +1106,16 @@ function handleReceiverMessage(message) {
 
 async function selectTargetFolder() {
     try {
-        const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
-        state.targetFolderHandle = handle;
+        if (IS_ELECTRON) {
+            const folderPath = await window.electronAPI.pickDirectory();
+            if (!folderPath) return;
+            state.targetFolderPath = folderPath;
+            state.targetFolderHandle = null;
+        } else {
+            const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+            state.targetFolderHandle = handle;
+            state.targetFolderPath = null;
+        }
         
         // Request manifest
         state.connection.send({
@@ -789,7 +1141,7 @@ async function startReceiving() {
     
     // Create folder structure
     for (const folder of manifest.folders) {
-        await createDirectory(state.targetFolderHandle, folder);
+        await createDirectory(IS_ELECTRON ? state.targetFolderPath : state.targetFolderHandle, folder);
     }
     
     // Process files
@@ -803,9 +1155,15 @@ async function startReceiving() {
 }
 
 async function createDirectory(rootHandle, path) {
+    if (IS_ELECTRON) {
+        const absolute = resolveAbsolutePath(rootHandle, path);
+        await window.electronAPI.ensureDir(absolute);
+        return;
+    }
+
     const parts = path.split('\\');
     let currentHandle = rootHandle;
-    
+
     for (const part of parts) {
         currentHandle = await currentHandle.getDirectoryHandle(part, { create: true });
     }
@@ -937,25 +1295,33 @@ async function completeBlock(filePath, blockIndex) {
 }
 
 async function writeBlockToFile(filePath, blockIndex, data, fileInfo) {
-    const parts = filePath.split('\\');
-    const fileName = parts.pop();
-    const dirPath = parts.join('\\');
-    
-    let dirHandle = state.targetFolderHandle;
-    if (dirPath) {
-        for (const part of parts) {
-            dirHandle = await dirHandle.getDirectoryHandle(part, { create: true });
+    if (IS_ELECTRON) {
+        if (!state.targetFolderPath) {
+            throw new Error('Target folder not selected');
         }
+        const absoluteFilePath = resolveAbsolutePath(state.targetFolderPath, filePath);
+        await window.electronAPI.writeFileAt(absoluteFilePath, blockIndex * BLOCK_SIZE, data);
+    } else {
+        const parts = filePath.split('\\');
+        const fileName = parts.pop();
+        const dirPath = parts.join('\\');
+        
+        let dirHandle = state.targetFolderHandle;
+        if (dirPath) {
+            for (const part of parts) {
+                dirHandle = await dirHandle.getDirectoryHandle(part, { create: true });
+            }
+        }
+        
+        // Get or create file
+        const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
+        const writable = await fileHandle.createWritable();
+        
+        // Seek to position and write
+        await writable.seek(blockIndex * BLOCK_SIZE);
+        await writable.write(data);
+        await writable.close();
     }
-    
-    // Get or create file
-    const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
-    const writable = await fileHandle.createWritable();
-    
-    // Seek to position and write
-    await writable.seek(blockIndex * BLOCK_SIZE);
-    await writable.write(data);
-    await writable.close();
     
     // If this is the last block, set modified date (best effort)
     if (blockIndex === fileInfo.blocks.length - 1) {

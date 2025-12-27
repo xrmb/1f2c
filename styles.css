@@ -15,6 +15,36 @@
     --shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.1);
 }
 
+/* Dark theme: driven by a simple class toggle on <html> */
+html.dark {
+    --bg: #0b1220;
+    --card-bg: #0f172a;
+    --text: #e2e8f0;
+    --text-muted: #94a3b8;
+    --border: #1f2a3a;
+    --shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+    --shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.45);
+    color-scheme: dark;
+}
+
+html:not(.dark) {
+    color-scheme: light;
+}
+
+/* Guaranteed visual change even if a component isn't using vars yet */
+html.dark body {
+    background: #0b1220 !important;
+    color: #e2e8f0 !important;
+}
+
+html.dark .card {
+    background: #0f172a !important;
+}
+
+html.dark p {
+    color: #94a3b8 !important;
+}
+
 * {
     margin: 0;
     padding: 0;
@@ -41,6 +71,29 @@ body {
 header {
     text-align: center;
     margin-bottom: 2rem;
+    position: relative;
+}
+
+.theme-toggle {
+    position: absolute;
+    right: 0;
+    top: 0;
+    z-index: 10;
+    border: 1px solid var(--border);
+    background: var(--card-bg);
+    color: var(--text);
+    border-radius: 999px;
+    padding: 0.4rem 0.75rem;
+    font-size: 0.875rem;
+    font-weight: 600;
+    cursor: pointer;
+    pointer-events: auto;
+    transition: transform 0.2s, box-shadow 0.2s, background 0.2s, border-color 0.2s;
+}
+
+.theme-toggle:hover {
+    transform: translateY(-1px);
+    box-shadow: var(--shadow);
 }
 
 h1 {
@@ -61,6 +114,10 @@ h1 {
 
 .screen.hidden {
     display: none;
+}
+
+.hidden {
+    display: none !important;
 }
 
 @keyframes fadeIn {
@@ -378,6 +435,44 @@ input[type="text"]:focus {
     margin-top: 1rem;
 }
 
+/* Scanner logs */
+#scanner-logs {
+    max-height: 200px;
+    overflow-y: auto;
+    background: #f8fafc;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.75rem;
+    margin-top: 1.5rem;
+    font-family: 'Courier New', monospace;
+    font-size: 0.75rem;
+}
+
+.log-item {
+    margin-bottom: 0.25rem;
+    line-height: 1.4;
+    word-break: break-all;
+}
+
+.log-info {
+    color: var(--text);
+}
+
+.log-success {
+    color: var(--success);
+    font-weight: 600;
+}
+
+.log-warning {
+    color: #f59e0b;
+    font-weight: 600;
+}
+
+.log-error {
+    color: var(--danger);
+    font-weight: 600;
+}
+
 /* Cached manifests */
 #cached-manifests {
     margin-bottom: 2rem;
@@ -392,6 +487,7 @@ input[type="text"]:focus {
 .cache-btn {
     text-align: left;
     padding: 1rem;
+    position: relative;
 }
 
 .cache-btn strong {
@@ -402,6 +498,28 @@ input[type="text"]:focus {
 .cache-btn small {
     color: var(--text-muted);
     font-size: 0.75rem;
+}
+
+.cache-dismiss {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: var(--danger);
+    color: white;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.25rem;
+    line-height: 1;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+.cache-dismiss:hover {
+    background: var(--danger-hover);
 }
 
 .divider {
