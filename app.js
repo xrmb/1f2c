@@ -3,7 +3,7 @@
 
 // ========== CONSTANTS ==========
 const BLOCK_SIZE = 16 * 1024 * 1024; // 16MB
-const CHUNK_SIZE = 256 * 1024; // 256KB
+const CHUNK_SIZE = 512 * 1024;
 const MAX_FILES = 10000;
 const CONNECTION_TIMEOUT = 60000; // 60 seconds
 const CACHE_EXPIRY_DAYS = 7;
@@ -17,6 +17,7 @@ const state = {
     peer: null,
     connection: null,
     shareCode: null,
+    remoteUsername: null,
     
     // Sender state
     folderHandle: null,
@@ -37,6 +38,11 @@ const state = {
     currentBlock: 0,
     bytesTransferred: 0,
     bytesTotalPlanned: null, // receiver: total bytes that actually need to transfer (delta)
+    bytesProcessed: 0, // receiver: bytes processed during block-checking/validation (not necessarily transferred)
+    progressPhase: 'transfer', // 'transfer' | 'checking' | 'validating'
+    totalBlocks: 0,
+    blocksCompleted: 0,
+    blocksProcessed: 0,
     receiverReportedDone: false, // sender: receiver confirmed it needs nothing / is done
     completionWarnings: [],
     startTime: null,
@@ -126,6 +132,18 @@ function resolveAbsolutePath(rootPath, relativePath) {
     if (!rootPath) throw new Error('Root path not set');
     const parts = normalizePath(relativePath).split('\\').filter(Boolean);
     return window.electronAPI.joinPath(rootPath, ...parts);
+}
+
+function safeSend(message) {
+    const conn = state.connection;
+    if (!conn || !conn.open) return false;
+    try {
+        conn.send(message);
+        return true;
+    } catch (e) {
+        console.warn('Send failed:', e);
+        return false;
+    }
 }
 
 // ========== LOCAL STORAGE ==========
@@ -374,15 +392,36 @@ function cleanup() {
     state.receivedManifest = null;
     state.targetIndex.clear();
     state.shareCode = null;
+    state.remoteUsername = null;
     state.isPaused = false;
     state.transferring = false;
     state.currentFile = null;
     state.currentBlock = 0;
     state.bytesTransferred = 0;
     state.bytesTotalPlanned = null;
+    state.bytesProcessed = 0;
+    state.progressPhase = 'transfer';
+    state.totalBlocks = 0;
+    state.blocksCompleted = 0;
+    state.blocksProcessed = 0;
     state.receiverReportedDone = false;
     state.completionWarnings = [];
     state.fileMap.clear();
+}
+
+function computeTotalBlocks(manifest) {
+    if (!manifest || !Array.isArray(manifest.files)) return 0;
+    let total = 0;
+    for (const f of manifest.files) {
+        if (f && Array.isArray(f.blocks)) total += f.blocks.length;
+    }
+    return total;
+}
+
+function updateBlockProgressUI() {
+    const el = document.getElementById('file-progress');
+    if (!el) return;
+    el.textContent = `${state.blocksCompleted} / ${state.totalBlocks}`;
 }
 
 // ========== SENDER: FOLDER SELECTION & INDEXING ==========
@@ -432,6 +471,8 @@ async function useCachedManifest(entry) {
 
 let indexingCancelled = false;
 let scannerLogs = [];
+let indexingTotalBlocks = 0;
+let indexingHashedBlocks = 0;
 
 function addScannerLog(message, type = 'info') {
     const timestamp = new Date().toLocaleTimeString();
@@ -488,6 +529,16 @@ async function indexFolder(dirHandleOrPath) {
         
         document.getElementById('indexing-total').textContent = files.length;
         document.getElementById('indexing-status').textContent = 'Hashing files...';
+
+        // Compute total blocks up-front so the progress % can be truly block-based.
+        indexingHashedBlocks = 0;
+        indexingTotalBlocks = files.reduce((sum, f) => {
+            const size = IS_ELECTRON ? f.size : (f.file ? f.file.size : 0);
+            return sum + Math.ceil(size / BLOCK_SIZE);
+        }, 0);
+        if (indexingTotalBlocks > 0) {
+            document.getElementById('indexing-status').textContent = `Hashing blocks... (0 / ${indexingTotalBlocks})`;
+        }
         
         addScannerLog('Starting hash computation...', 'info');
         
@@ -509,11 +560,14 @@ async function indexFolder(dirHandleOrPath) {
             
             const fileInfo = files[i];
             document.getElementById('indexing-current').textContent = (i + 1);
+            // Keep showing the current file, but do NOT update % here when we are using block-based progress.
             document.getElementById('indexing-current-file').textContent = fileInfo.path;
-            
-            const progress = ((i + 1) / files.length) * 100;
-            document.getElementById('indexing-progress').style.width = progress + '%';
-            document.getElementById('indexing-percent').textContent = Math.round(progress) + '%';
+
+            if (!indexingTotalBlocks || indexingTotalBlocks <= 0) {
+                const progress = ((i + 1) / files.length) * 100;
+                document.getElementById('indexing-progress').style.width = progress + '%';
+                document.getElementById('indexing-percent').textContent = Math.round(progress) + '%';
+            }
             
             addScannerLog(`Hashing file [${i + 1}/${files.length}]: ${fileInfo.path}`, 'info');
 
@@ -624,6 +678,10 @@ async function hashFilePath(absoluteFilePath, relativeFilePath, fileSize) {
     for (let i = 0; i < blockCount; i++) {
         if (indexingCancelled) throw new Error('Cancelled');
 
+        // Per-block UI updates so large files don't look stuck
+        const currentFileEl = document.getElementById('indexing-current-file');
+        if (currentFileEl) currentFileEl.textContent = `${relativeFilePath} (block ${i + 1}/${blockCount})`;
+
         const start = i * BLOCK_SIZE;
         const end = Math.min(start + BLOCK_SIZE, fileSize);
         const arrayBuffer = await window.electronAPI.readFileSlice(absoluteFilePath, start, end);
@@ -635,6 +693,18 @@ async function hashFilePath(absoluteFilePath, relativeFilePath, fileSize) {
             index: i,
             hash: hashBase64
         });
+
+        // Block-based overall %
+        indexingHashedBlocks++;
+        if (indexingTotalBlocks > 0) {
+            const pct = Math.max(0, Math.min(100, (indexingHashedBlocks / indexingTotalBlocks) * 100));
+            const bar = document.getElementById('indexing-progress');
+            const percentEl = document.getElementById('indexing-percent');
+            const statusEl = document.getElementById('indexing-status');
+            if (bar) bar.style.width = pct + '%';
+            if (percentEl) percentEl.textContent = Math.round(pct) + '%';
+            if (statusEl) statusEl.textContent = `Hashing blocks... (${indexingHashedBlocks} / ${indexingTotalBlocks})`;
+        }
 
         addScannerLog(`    Block ${i}/${blockCount - 1}: ${hashBase64.substring(0, 16)}...`, 'info');
     }
@@ -728,6 +798,10 @@ async function hashFile(file, filePath) {
     
     for (let i = 0; i < blockCount; i++) {
         if (indexingCancelled) throw new Error('Cancelled');
+
+        // Per-block UI updates so large files don't look stuck
+        const currentFileEl = document.getElementById('indexing-current-file');
+        if (currentFileEl) currentFileEl.textContent = `${filePath} (block ${i + 1}/${blockCount})`;
         
         const start = i * BLOCK_SIZE;
         const end = Math.min(start + BLOCK_SIZE, file.size);
@@ -741,6 +815,18 @@ async function hashFile(file, filePath) {
             index: i,
             hash: hashBase64
         });
+
+        // Block-based overall %
+        indexingHashedBlocks++;
+        if (indexingTotalBlocks > 0) {
+            const pct = Math.max(0, Math.min(100, (indexingHashedBlocks / indexingTotalBlocks) * 100));
+            const bar = document.getElementById('indexing-progress');
+            const percentEl = document.getElementById('indexing-percent');
+            const statusEl = document.getElementById('indexing-status');
+            if (bar) bar.style.width = pct + '%';
+            if (percentEl) percentEl.textContent = Math.round(pct) + '%';
+            if (statusEl) statusEl.textContent = `Hashing blocks... (${indexingHashedBlocks} / ${indexingTotalBlocks})`;
+        }
         
         addScannerLog(`    Block ${i}/${blockCount - 1}: ${hashBase64.substring(0, 16)}...`, 'info');
     }
@@ -826,12 +912,35 @@ function handleIncomingConnection(conn) {
 function handleSenderMessage(message) {
     switch (message.type) {
         case 'hello':
+            state.remoteUsername = message.username || null;
             showApprovalScreen(message.username);
             break;
         case 'request_manifest':
+            // Receiver is ready; switch sender UI out of waiting state.
+            if (state.mode === 'sender') {
+                const titleEl = document.getElementById('transfer-title');
+                if (titleEl && titleEl.textContent === 'Waiting for receiver...') {
+                    titleEl.textContent = 'Sending Files';
+                }
+                const peerEl = document.getElementById('peer-name');
+                if (peerEl && state.remoteUsername) {
+                    peerEl.textContent = state.remoteUsername;
+                }
+            }
             sendManifest();
             break;
         case 'request_block':
+            // Receiver actively requesting data; ensure we show active state.
+            if (state.mode === 'sender') {
+                const titleEl = document.getElementById('transfer-title');
+                if (titleEl && titleEl.textContent === 'Waiting for receiver...') {
+                    titleEl.textContent = 'Sending Files';
+                }
+                const peerEl = document.getElementById('peer-name');
+                if (peerEl && state.remoteUsername) {
+                    peerEl.textContent = state.remoteUsername;
+                }
+            }
             sendBlock(message.file, message.block);
             break;
         case 'pause':
@@ -884,23 +993,29 @@ function handleApproval(accepted) {
     if (accepted) {
         state.connection.send({
             type: 'acknowledge',
-            accepted: true
+            accepted: true,
+            senderUsername: state.username
         });
         
         // Wait for receiver to select folder and request manifest
         showScreen('transfer-screen');
         document.getElementById('transfer-title').textContent = 'Waiting for receiver...';
-        document.getElementById('peer-name').textContent = 'Connected';
+        document.getElementById('peer-name').textContent = state.remoteUsername || 'Receiver';
         state.transferring = true;
         state.startTime = Date.now();
         state.bytesTransferred = 0;
         state.currentFile = null;
         state.currentBlock = 0;
+        state.totalBlocks = computeTotalBlocks(state.manifest);
+        state.blocksCompleted = 0;
+        state.blocksProcessed = 0;
+        updateBlockProgressUI();
         updateTransferUI();
     } else {
         state.connection.send({
             type: 'acknowledge',
             accepted: false,
+            senderUsername: state.username,
             reason: 'rejected'
         });
         state.connection.close();
@@ -999,6 +1114,10 @@ async function sendBlock(filePath, blockIndex) {
             file: filePath,
             block: blockIndex
         });
+
+        // Block-level progress for sender
+        state.blocksCompleted++;
+        updateBlockProgressUI();
         
     } catch (error) {
         state.connection.send({
@@ -1128,6 +1247,11 @@ function handleReceiverMessage(message) {
                 clearInterval(state.timeoutId);
                 state.timeoutId = null;
             }
+
+            // Store sender name for UI.
+            if (message.senderUsername) {
+                state.remoteUsername = message.senderUsername;
+            }
             
             if (message.accepted) {
                 // Approved! Ask for target folder
@@ -1153,6 +1277,16 @@ function handleReceiverMessage(message) {
         case 'error':
             showError('Sender error: ' + message.message);
             break;
+
+        case 'cancel':
+            // Sender cancelled the transfer.
+            // Mark as transferring to suppress the close handler's generic message.
+            state.transferring = true;
+            try {
+                if (state.connection) state.connection.close();
+            } catch (_) {}
+            showError('Transfer cancelled by sender');
+            break;
             
         default:
             console.warn('Unknown message type:', message.type);
@@ -1175,9 +1309,13 @@ async function selectTargetFolder() {
         // Index target folder first for delta sync
         showScreen('transfer-screen');
         document.getElementById('transfer-title').textContent = 'Scanning Target Folder';
+        const peerNameEl = document.getElementById('peer-name');
+        if (peerNameEl) peerNameEl.textContent = state.remoteUsername || 'Sender';
         document.getElementById('current-file-name').textContent = '';
         state.bytesTransferred = 0;
         state.bytesTotalPlanned = null;
+        state.bytesProcessed = 0;
+        state.progressPhase = 'checking';
         updateTransferUI();
 
         await indexReceiverTargetFolder();
@@ -1273,9 +1411,14 @@ async function startReceiving() {
     
     // Process files
     state.bytesTransferred = 0;
+    state.bytesProcessed = 0;
+    state.progressPhase = 'checking';
     state.bytesTotalPlanned = manifest.totalSize;
+    state.totalBlocks = computeTotalBlocks(manifest);
+    state.blocksCompleted = 0;
+    state.blocksProcessed = 0;
     document.getElementById('transfer-total-bytes').textContent = formatBytes(state.bytesTotalPlanned);
-    document.getElementById('file-progress').textContent = `0 / ${manifest.fileCount}`;
+    updateBlockProgressUI();
 
     document.getElementById('transfer-title').textContent = 'Receiving Files';
     state.startTime = Date.now();
@@ -1344,6 +1487,17 @@ async function requestNextBlock() {
             const blockEnd = Math.min(blockStart + BLOCK_SIZE, file.size);
             const blockLen = Math.max(0, blockEnd - blockStart);
 
+            // Update UI so large files don't look stuck while we decide what to request.
+            state.progressPhase = 'checking';
+            state.currentFile = file.path;
+            state.currentBlock = blockIndex;
+            const currentFileEl = document.getElementById('current-file-name');
+            if (currentFileEl) currentFileEl.textContent = `${file.path} (checking block ${blockIndex + 1}/${file.blocks.length})`;
+            // Count the work we're about to do (hashing or deciding) as processed progress.
+            state.bytesProcessed += blockLen;
+            state.blocksProcessed++;
+            updateTransferUI();
+
             let shouldDownload = true;
             if (!fileData.forceDownloadAll) {
                 shouldDownload = await receiverShouldDownloadBlock(file, blockIndex, blockStart, blockEnd);
@@ -1351,6 +1505,8 @@ async function requestNextBlock() {
 
             if (!shouldDownload) {
                 fileData.completedBlocks++;
+                state.blocksCompleted++;
+                updateBlockProgressUI();
 
                 // Adjust planned bytes downward as we discover blocks we can reuse locally.
                 if (typeof state.bytesTotalPlanned === 'number' && Number.isFinite(state.bytesTotalPlanned)) {
@@ -1366,6 +1522,7 @@ async function requestNextBlock() {
             }
 
             // Request this block
+            state.progressPhase = 'transfer';
             state.currentFile = file.path;
             state.currentBlock = blockIndex;
 
@@ -1382,10 +1539,6 @@ async function requestNextBlock() {
         
         // File complete (either fully reused or received)
         state.currentFileIndex++;
-
-        const completedFiles = state.currentFileIndex;
-        const totalFiles = state.receivedManifest.fileCount;
-        document.getElementById('file-progress').textContent = `${completedFiles} / ${totalFiles}`;
     }
     
     // All files complete!
@@ -1517,12 +1670,9 @@ async function completeBlock(filePath, blockIndex) {
         
         // Mark block as complete
         fileData.completedBlocks++;
+        state.blocksCompleted++;
+        updateBlockProgressUI();
         fileData.blocks.delete(blockIndex);
-        
-        // Update file progress
-        const completedFiles = state.currentFileIndex;
-        const totalFiles = state.receivedManifest.fileCount;
-        document.getElementById('file-progress').textContent = `${completedFiles} / ${totalFiles}`;
         
         // Request next block
         await requestNextBlock();
@@ -1561,14 +1711,13 @@ async function writeBlockToFile(filePath, blockIndex, data, fileInfo) {
         await writable.close();
     }
     
-    // If this is the last block, set modified date (best effort)
+    // File date preservation is best-effort and should fail silently.
+    // (Browser File System Access API doesn't support setting modified date.)
     if (blockIndex === fileInfo.blocks.length - 1) {
         try {
-            // Note: File System Access API doesn't support setting modified date
-            // This is a documented limitation
-            addWarning(`File date not preserved: ${filePath}`);
-        } catch (error) {
-            console.warn('Failed to set file date:', error);
+            // No-op
+        } catch (_) {
+            // Intentionally silent
         }
     }
 }
@@ -1593,7 +1742,7 @@ function addWarning(message) {
 
 function pauseTransfer() {
     state.isPaused = true;
-    state.connection.send({ type: 'pause' });
+    safeSend({ type: 'pause' });
     document.getElementById('pause-btn').classList.add('hidden');
     document.getElementById('resume-btn').classList.remove('hidden');
     document.getElementById('connection-indicator').textContent = 'Paused';
@@ -1602,7 +1751,7 @@ function pauseTransfer() {
 
 function resumeTransfer() {
     state.isPaused = false;
-    state.connection.send({ type: 'resume' });
+    safeSend({ type: 'resume' });
     document.getElementById('pause-btn').classList.remove('hidden');
     document.getElementById('resume-btn').classList.add('hidden');
     document.getElementById('connection-indicator').textContent = 'Connected';
@@ -1615,8 +1764,10 @@ function resumeTransfer() {
 
 function cancelTransfer() {
     if (confirm('Are you sure you want to cancel the transfer?')) {
-        state.connection.send({ type: 'cancel' });
-        state.connection.close();
+        safeSend({ type: 'cancel' });
+        try {
+            if (state.connection) state.connection.close();
+        } catch (_) {}
         showError('Transfer cancelled');
     }
 }
@@ -1625,23 +1776,42 @@ function updateTransferUI() {
     const manifest = state.mode === 'sender' ? state.manifest : state.receivedManifest;
     if (!manifest) return;
     
+    const isReceiver = state.mode === 'receiver';
+    const phase = isReceiver ? state.progressPhase : 'transfer';
+
+    const totalBlocks = state.totalBlocks;
+    const displayBlocks = isReceiver
+        ? (phase === 'transfer' ? state.blocksCompleted : state.blocksProcessed)
+        : state.blocksCompleted;
+
+    const displayTotalSize =
+        isReceiver && (phase === 'checking' || phase === 'validating')
+            ? manifest.totalSize
+            : (isReceiver && typeof state.bytesTotalPlanned === 'number' && Number.isFinite(state.bytesTotalPlanned)
+                ? state.bytesTotalPlanned
+                : manifest.totalSize);
+
+    const displayBytes =
+        isReceiver && (phase === 'checking' || phase === 'validating')
+            ? state.bytesProcessed
+            : state.bytesTransferred;
+
     // Update bytes
-    document.getElementById('transfer-bytes').textContent = formatBytes(state.bytesTransferred);
+    document.getElementById('transfer-bytes').textContent = formatBytes(displayBytes);
     
     // Update percentage
-    const totalSize = (state.mode === 'receiver' && typeof state.bytesTotalPlanned === 'number' && Number.isFinite(state.bytesTotalPlanned))
-        ? state.bytesTotalPlanned
-        : manifest.totalSize;
-    const percent = totalSize > 0 ? (state.bytesTransferred / totalSize) * 100 : 0;
+    const percent = totalBlocks > 0
+        ? (displayBlocks / totalBlocks) * 100
+        : (displayTotalSize > 0 ? (displayBytes / displayTotalSize) * 100 : 0);
     document.getElementById('transfer-progress').style.width = percent + '%';
     document.getElementById('transfer-percent').textContent = Math.round(percent) + '%';
     
     // Update speed and ETA
     const elapsed = (Date.now() - state.startTime) / 1000;
-    const speed = state.bytesTransferred / elapsed;
+    const speed = displayBytes / elapsed;
     document.getElementById('transfer-speed').textContent = formatBytes(speed) + '/s';
     
-    const remaining = totalSize - state.bytesTransferred;
+    const remaining = displayTotalSize - displayBytes;
     const eta = remaining / speed;
     document.getElementById('transfer-eta').textContent = formatTime(eta);
 }
@@ -1717,6 +1887,11 @@ async function validateReceivedFiles() {
 
     validateManifestForReceiver(manifest);
 
+    state.progressPhase = 'validating';
+    state.bytesProcessed = 0;
+    state.blocksProcessed = 0;
+    updateTransferUI();
+
     const titleEl = document.getElementById('transfer-title');
     if (titleEl) titleEl.textContent = 'Validating Files';
 
@@ -1751,6 +1926,15 @@ async function validateReceivedFiles() {
         for (let blockIndex = 0; blockIndex < fileInfo.blocks.length; blockIndex++) {
             const start = blockIndex * BLOCK_SIZE;
             const end = Math.min(start + BLOCK_SIZE, fileInfo.size);
+
+            // Update UI progress per block during validation
+            state.currentFile = relPath;
+            state.currentBlock = blockIndex;
+            const currentFileEl2 = document.getElementById('current-file-name');
+            if (currentFileEl2) currentFileEl2.textContent = `${relPath} (validating block ${blockIndex + 1}/${fileInfo.blocks.length})`;
+            state.bytesProcessed += Math.max(0, end - start);
+            state.blocksProcessed++;
+            updateTransferUI();
 
             let arrayBuffer;
             if (IS_ELECTRON) {

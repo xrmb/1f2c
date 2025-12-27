@@ -386,8 +386,8 @@ input[type="text"]:focus {
 
 /* Transfer controls */
 .transfer-controls {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
+    display: flex;
+    flex-direction: column;
     gap: 0.5rem;
     margin-top: 2rem;
 }
